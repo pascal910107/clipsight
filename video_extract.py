@@ -6,12 +6,14 @@
 """Turn a video (URL or local file) into timestamped frames + transcript for an LLM to read.
 
 Pipeline: yt-dlp metadata -> native subtitles (preferred) -> download <=720p ->
-ffmpeg scene detection + gap filling -> frames (<=768px) + 3x3 contact sheets ->
-local mlx-whisper transcription when no subtitles -> timeline.md.
+ffmpeg scene detection + gap filling -> near-duplicate removal -> frames (<=768px) +
+3x3 contact sheets -> local mlx-whisper transcription when no subtitles -> timeline.md.
 
 Usage:
-  video_extract.py URL_OR_FILE [--probe] [--max-frames 100] [--interval 5]
+  video_extract.py URL_OR_FILE [--probe] [--start 10:00 --end 15:00] [--max-frames 100]
                    [--no-frames] [--force-asr] [--lang zh] [--cookies-from-browser chrome]
+  video_extract.py URL_OR_FILE --at 03:12,05:40      # grab full-res frames at given times
+  video_extract.py URL_OR_FILE --audio-only [--audio-format wav --sample-rate 16000 --mono]
 """
 from __future__ import annotations
 
@@ -31,9 +33,16 @@ HERE = Path(__file__).resolve().parent
 PREFERRED_SUB_LANGS = ["zh-TW", "zh-Hant", "zh-HK", "zh", "zh-Hans", "zh-CN", "en", "en-US", "en-GB", "ja", "ko"]
 SCENE_THRESHOLD = 0.3
 FRAME_MAX_EDGE = 768
+AT_FRAME_MAX_EDGE = 1280
 SHEET_GRID = 3
 SHEET_CELL_W = 512  # max cell edge
 SHEET_GAP = 6
+DEDUP_THRESHOLD = 3.0  # mean abs difference (0-255) of 16x16 grayscale thumbnails
+DEDUP_MAX_GAP = 60.0  # keep at least one frame per minute even on a static shot
+
+# Run yt-dlp on uv's own Python instead of the Homebrew one: Homebrew Python upgrades
+# can break yt-dlp (e.g. python@3.15 pyexpat vs system libexpat). Override with YTDLP="yt-dlp".
+YTDLP = os.environ.get("YTDLP", "uvx --python 3.13 --from yt-dlp[default]@latest yt-dlp").split()
 
 
 def log(msg: str) -> None:
@@ -49,12 +58,27 @@ def ts(sec: float) -> str:
     return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
 
 
+def parse_time(s: str) -> float:
+    """'90', '1:30', '01:01:30', '1:30.5' -> seconds."""
+    try:
+        sec = 0.0
+        for part in s.strip().split(":"):
+            sec = sec * 60 + float(part)
+    except ValueError:
+        sec = -1.0
+    if not (0 <= sec < float("inf")):  # also rejects nan
+        sys.exit(f"bad time: {s!r} (use SS, MM:SS or HH:MM:SS)")
+    return sec
+
+
+def range_tag(start: float | None, end: float | None) -> str:
+    """Cache/file suffix for a time range, e.g. '_r10.5-20' ('' when no range)."""
+    if start is None and end is None:
+        return ""
+    return f"_r{start or 0:g}-{'end' if end is None else f'{end:g}'}"
+
+
 # ---------------------------------------------------------------- metadata
-
-# Run yt-dlp on uv's own Python instead of the Homebrew one: Homebrew Python upgrades
-# can break yt-dlp (e.g. python@3.15 pyexpat vs system libexpat). Override with YTDLP="yt-dlp".
-YTDLP = os.environ.get("YTDLP", "uvx --python 3.13 --from yt-dlp[default]@latest yt-dlp").split()
-
 
 def ytdlp_base(args) -> list[str]:
     cmd = YTDLP + ["--no-playlist", "--no-warnings"]
@@ -115,6 +139,7 @@ def summarize_probe(info: dict) -> dict:
         "manual_subs": sorted((info.get("subtitles") or {}).keys()),
         "has_auto_captions": bool(info.get("automatic_captions")),
         "chosen_subtitle": pick_subtitle(info, None),
+        "chapters": [f"{ts(c['start_time'])} {c['title']}" for c in info.get("chapters") or []],
     }
 
 
@@ -168,17 +193,31 @@ def fetch_subtitles(url: str, lang: str, is_auto: bool, out: Path, args) -> list
 
 # ---------------------------------------------------------------- media
 
-def download_video(url: str, out: Path, args) -> Path:
+def get_video(source: str, is_local: bool, vid: str, args) -> tuple[Path, bool]:
+    """Return (video path, downloaded by this call). Local files are used in place; remote videos
+    are downloaded once to the per-video cache dir. Only a finished download is named video.*,
+    so fragments of an interrupted run are never mistaken for the video."""
+    if is_local:
+        return Path(source).expanduser().resolve(), False
+    vdir = CACHE_ROOT / vid
+    vdir.mkdir(parents=True, exist_ok=True)
+    have = sorted(vdir.glob("video.*"))
+    if have and not args.refresh:
+        return have[0], False
+    for f in have + sorted(vdir.glob("dl.*")):
+        f.unlink()
     cmd = ytdlp_base(args) + [
         "-f", "bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/b",
-        "--merge-output-format", "mp4", "-o", str(out / "video.%(ext)s"), "--", url]
+        "--merge-output-format", "mp4", "-o", str(vdir / "dl.%(ext)s"),
+        "--no-simulate", "--print", "after_move:filepath", "--", source]
     log("downloading video (<=720p)...")
     p = run(cmd)
-    vids = [f for f in out.glob("video.*") if f.suffix not in (".part", ".ytdl")]
-    if p.returncode != 0 or not vids:
+    done = Path(p.stdout.strip().splitlines()[-1]) if p.returncode == 0 and p.stdout.strip() else None
+    if done is None or not done.exists():
         sys.exit(f"download failed: {p.stderr.strip()[-500:]}\n"
                  "Possibly deleted/private/region-blocked. Try --cookies-from-browser chrome.")
-    return vids[0]
+    video = done.rename(vdir / f"video{done.suffix}")
+    return video, True
 
 
 def media_info(path: Path) -> dict:
@@ -190,38 +229,56 @@ def media_info(path: Path) -> dict:
             "has_video": "video" in types, "has_audio": "audio" in types}
 
 
-def detect_scenes(video: Path) -> list[tuple[float, float]]:
-    """Return [(time, scene_score)] for scene cuts, decoding a downscaled stream."""
+def window_args(start: float, end: float) -> list[str]:
+    """ffmpeg input options limiting decoding to [start, end); output timestamps restart at 0."""
+    return ["-ss", f"{start:.3f}", "-t", f"{end - start:.3f}"]
+
+
+def detect_scenes(video: Path, start: float, end: float) -> list[tuple[float, float]]:
+    """Return [(absolute time, scene_score)] for scene cuts, decoding a downscaled stream."""
     log("detecting scene changes...")
-    p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(video), "-an",
+    p = run(["ffmpeg", "-hide_banner", "-nostats", *window_args(start, end), "-i", str(video), "-an",
              "-vf", f"scale=320:-2,select='gt(scene,{SCENE_THRESHOLD})',metadata=print",
              "-f", "null", "-"])
-    out, scenes, t = p.stderr, [], None
-    for line in out.splitlines():
+    scenes, t = [], None
+    for line in p.stderr.splitlines():
         m = re.search(r"pts_time:([\d.]+)", line)
         if m:
             t = float(m.group(1))
         m = re.search(r"lavfi\.scene_score=([\d.]+)", line)
         if m and t is not None:
-            scenes.append((t, float(m.group(1))))
+            scenes.append((start + t, float(m.group(1))))
             t = None
     return scenes
 
 
-def plan_frames(duration: float, scenes: list[tuple[float, float]], interval: float, max_frames: int) -> list[dict]:
-    end = max(duration - 0.5, 0)
-    cands = [{"t": 0.5 if duration > 1 else 0, "kind": "start", "score": 2.0}]
-    cands += [{"t": min(t + 0.2, end), "kind": "scene", "score": s} for t, s in scenes]
+def thin(frames: list[dict], start: float, end: float, n: int) -> list[dict]:
+    """Keep coverage: one frame per equal time bucket, preferring the strongest scene cut."""
+    if len(frames) <= n:
+        return frames
+    span = max(end - start, 1e-6)
+    buckets: dict[int, dict] = {}
+    for c in frames:
+        k = min(max(int((c["t"] - start) / span * n), 0), n - 1)
+        if k not in buckets or c["score"] > buckets[k]["score"]:
+            buckets[k] = c
+    return [buckets[k] for k in sorted(buckets)]
+
+
+def plan_frames(start: float, end: float, scenes: list[tuple[float, float]], interval: float, max_frames: int) -> list[dict]:
+    first = start + 0.5 if end - start > 1 else start
+    last = max(end - 0.5, first)
+    cands = [{"t": first, "kind": "start", "score": 2.0}]
+    cands += [{"t": min(t + 0.2, last), "kind": "scene", "score": s} for t, s in scenes]
     cands.sort(key=lambda c: c["t"])
     # Fill long stretches without a cut so no gap exceeds `interval`.
-    filled, edges = [], cands + [{"t": end, "kind": "end", "score": 0.0}]
+    filled, edges = [], cands + [{"t": last, "kind": "end", "score": 0.0}]
     for a, b in zip(edges, edges[1:]):
         filled.append(a)
         gap = b["t"] - a["t"]
         n = int(gap // interval)
         for i in range(1, n + 1):
-            t = a["t"] + gap * i / (n + 1)
-            filled.append({"t": t, "kind": "fill", "score": 0.0})
+            filled.append({"t": a["t"] + gap * i / (n + 1), "kind": "fill", "score": 0.0})
     # Dedupe frames closer than 1s.
     frames = []
     for c in filled:
@@ -229,33 +286,58 @@ def plan_frames(duration: float, scenes: list[tuple[float, float]], interval: fl
             frames.append(c)
         elif c["score"] > frames[-1]["score"]:
             frames[-1] = c
-    if len(frames) > max_frames:
-        # Keep coverage: one frame per equal time bucket, preferring the strongest scene cut.
-        buckets: dict[int, dict] = {}
-        for c in frames:
-            k = min(int(c["t"] / max(duration, 1e-6) * max_frames), max_frames - 1)
-            if k not in buckets or c["score"] > buckets[k]["score"]:
-                buckets[k] = c
-        frames = [buckets[k] for k in sorted(buckets)]
-    return frames
+    return thin(frames, start, end, max_frames)
+
+
+def grab_frame(video: Path, t: float, dest: Path, max_edge: int) -> bool:
+    scale = f"scale='min({max_edge},iw)':'min({max_edge},ih)':force_original_aspect_ratio=decrease"
+    p = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{t:.2f}",
+             "-i", str(video), "-frames:v", "1", "-vf", scale, "-q:v", "3", str(dest)])
+    return p.returncode == 0 and dest.exists()
 
 
 def extract_frames(video: Path, frames: list[dict], out: Path) -> None:
     fdir = out / "frames"
     fdir.mkdir(exist_ok=True)
-    scale = f"scale={FRAME_MAX_EDGE}:{FRAME_MAX_EDGE}:force_original_aspect_ratio=decrease"
 
-    def grab(i_f):
-        i, f = i_f
-        name = f"f{i:03d}_{ts(f['t']).replace(':', '-')}.jpg"
-        p = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{f['t']:.2f}",
-                 "-i", str(video), "-frames:v", "1", "-vf", scale, "-q:v", "3", str(fdir / name)])
-        f["file"] = f"frames/{name}" if p.returncode == 0 and (fdir / name).exists() else None
+    def grab(f):
+        name = f"t{f['t']:09.2f}.jpg"
+        f["file"] = f"frames/{name}" if grab_frame(video, f["t"], fdir / name, FRAME_MAX_EDGE) else None
 
     log(f"extracting {len(frames)} frames...")
     with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(grab, enumerate(frames, 1)))
+        list(ex.map(grab, frames))
     frames[:] = [f for f in frames if f.get("file")]
+
+
+def drop_near_duplicates(frames: list[dict], out: Path) -> int:
+    """Remove frames that look almost identical to the previous kept one (static slides, talking heads)."""
+    from PIL import Image
+
+    def sig(f):
+        return Image.open(out / f["file"]).convert("L").resize((16, 16)).tobytes()
+
+    kept, prev, dropped = [], None, 0
+    for f in frames:
+        s = sig(f)
+        if prev is not None and f["kind"] != "start" and f["t"] - kept[-1]["t"] < DEDUP_MAX_GAP:
+            diff = sum(abs(a - b) for a, b in zip(s, prev)) / len(s)
+            if diff < DEDUP_THRESHOLD:
+                (out / f["file"]).unlink(missing_ok=True)
+                dropped += 1
+                continue
+        kept.append(f)
+        prev = s
+    frames[:] = kept
+    return dropped
+
+
+def finalize_frame_names(frames: list[dict], out: Path) -> None:
+    """Renumber kept frames as fNNN_HH-MM-SS.jpg in time order."""
+    for i, f in enumerate(frames, 1):
+        name = f"f{i:03d}_{ts(f['t']).replace(':', '-')}.jpg"
+        (out / f["file"]).rename(out / "frames" / name)
+        f["file"] = f"frames/{name}"
 
 
 def make_sheets(frames: list[dict], out: Path) -> list[dict]:
@@ -296,9 +378,9 @@ def make_sheets(frames: list[dict], out: Path) -> list[dict]:
     return sheets
 
 
-def transcribe_local(video: Path, out: Path, lang: str | None) -> list[dict]:
+def transcribe_local(video: Path, out: Path, lang: str | None, start: float, end: float) -> list[dict]:
     audio = out / "audio.mp3"
-    p = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+    p = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *window_args(start, end), "-i", str(video),
              "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio)])
     if p.returncode != 0:
         log(f"audio extraction failed: {p.stderr.strip()[-300:]}")
@@ -315,6 +397,9 @@ def transcribe_local(video: Path, out: Path, lang: str | None) -> list[dict]:
         return []
     segs = json.loads(seg_json.read_text(encoding="utf-8"))
     seg_json.unlink()
+    for s in segs:
+        s["start"] += start
+        s["end"] += start
     return segs
 
 
@@ -325,10 +410,10 @@ def write_outputs(out: Path, meta: dict, frames: list[dict], sheets: list[dict],
         "\n".join(f"[{ts(s['start'])}] {s['text']}" for s in segs) + "\n", encoding="utf-8")
 
     L = [f"# {meta.get('title') or 'Untitled'}", ""]
-    for k in ("source", "uploader", "upload_date", "duration", "transcript_source"):
+    for k in ("source", "uploader", "upload_date", "duration", "range", "transcript_source"):
         if meta.get(k):
             L.append(f"- **{k}**: {meta[k]}")
-    L.append(f"- **frames**: {len(frames)} (scene cuts + gap fill, max edge {FRAME_MAX_EDGE}px)")
+    L.append(f"- **frames**: {len(frames)} (scene cuts + gap fill, near-duplicates removed, max edge {FRAME_MAX_EDGE}px)")
     if meta.get("limitations"):
         L.append(f"- **limitations**: {'; '.join(meta['limitations'])}")
     if meta.get("chapters"):
@@ -341,6 +426,7 @@ def write_outputs(out: Path, meta: dict, frames: list[dict], sheets: list[dict],
 
     L += ["", "## Timeline"]
     if frames:
+        # Each frame gets the speech until the next frame; speech before the first frame goes to it too.
         bounds = [f["t"] for f in frames] + [float("inf")]
         si = 0
         for i, f in enumerate(frames):
@@ -359,6 +445,8 @@ def write_outputs(out: Path, meta: dict, frames: list[dict], sheets: list[dict],
     (out / "manifest.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ---------------------------------------------------------------- modes
+
 LOCAL_COPY_EXT = {"aac": "m4a", "alac": "m4a", "mp3": "mp3", "opus": "opus", "vorbis": "ogg", "flac": "flac"}
 
 
@@ -367,32 +455,46 @@ def extract_audio(source: str, is_local: bool, info: dict, vid: str, args) -> No
     out = Path(args.audio_dir).expanduser() if args.audio_dir else CACHE_ROOT / vid / "audio"
     out.mkdir(parents=True, exist_ok=True)
     fmt = args.audio_format
-    if is_local:
-        src = Path(source).expanduser()
+    rng = args.start is not None or args.end is not None
+    stem = vid + range_tag(args.start, args.end)
+    src = Path(source).expanduser() if is_local else None
+    if not is_local:
+        cmd = ytdlp_base(args) + ["-f", "ba/b", "-x", "--audio-format", "best" if fmt == "original" else fmt,
+                                  "-o", str(out / f"{vid}.full.%(ext)s")]
+        if args.ffmpeg_audio_opts:
+            cmd += ["--postprocessor-args", "ExtractAudio:" + " ".join(args.ffmpeg_audio_opts)]
+        log("downloading audio...")
+        p = run(cmd + ["--", source])
+        files = [f for f in out.glob(f"{vid}.full.*") if f.suffix not in (".part", ".ytdl", ".json")]
+        if p.returncode != 0 or not files:
+            sys.exit(f"audio download failed: {p.stderr.strip()[-500:]}")
+        downloaded = max(files, key=lambda f: f.stat().st_mtime)
+        if rng:
+            src = downloaded
+        else:
+            dest = out / f"{stem}{downloaded.suffix}"
+            downloaded.replace(dest)
+    if src is not None:
         p = run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
                  "-of", "csv=p=0", str(src)])
         codec = p.stdout.strip()
         if not codec:
             sys.exit("no audio track in this file")
+        # Remote audio was already converted by yt-dlp, so only cut it; local audio still needs encoding.
+        copy = fmt == "original" or not is_local
         ext = LOCAL_COPY_EXT.get(codec, "mka") if fmt == "original" else fmt
-        dest = out / f"{vid}.{ext}"
-        enc = ["-c:a", "copy"] if fmt == "original" else []
-        p = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-vn", "-map", "a:0",
-                 *enc, *args.ffmpeg_audio_opts, str(dest)])
+        dest = out / f"{stem}.{ext}"
+        start = args.start or 0.0
+        win = window_args(start, args.end) if args.end is not None else ["-ss", f"{start:.3f}"]
+        p = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *win, "-i", str(src), "-vn", "-map", "a:0",
+                 *(["-c:a", "copy"] if copy else args.ffmpeg_audio_opts), str(dest)])
+        if not is_local:
+            src.unlink(missing_ok=True)
         if p.returncode != 0:
             sys.exit(f"audio extraction failed: {p.stderr.strip()[-300:]}")
-    else:
-        cmd = ytdlp_base(args) + ["-f", "ba/b", "-x", "--audio-format", "best" if fmt == "original" else fmt,
-                                  "-o", str(out / f"{vid}.%(ext)s")]
-        if args.ffmpeg_audio_opts:
-            cmd += ["--postprocessor-args", "ExtractAudio:" + " ".join(args.ffmpeg_audio_opts)]
-        log("downloading audio...")
-        p = run(cmd + ["--", source])
-        files = [f for f in out.glob(f"{vid}.*") if f.suffix not in (".part", ".ytdl", ".json")]
-        if p.returncode != 0 or not files:
-            sys.exit(f"audio download failed: {p.stderr.strip()[-500:]}")
-        dest = max(files, key=lambda f: f.stat().st_mtime)
     sidecar = {"source": source, "audio": str(dest), **media_info(dest)}
+    if rng:
+        sidecar["range"] = [args.start or 0, args.end]
     if info:
         sidecar.update({k: info.get(k) for k in ("id", "title", "uploader", "upload_date", "description", "webpage_url")})
     dest.with_suffix(".json").write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -400,17 +502,38 @@ def extract_audio(source: str, is_local: bool, info: dict, vid: str, args) -> No
     print(dest)
 
 
+def grab_at(source: str, is_local: bool, vid: str, times: list[float], args) -> None:
+    """Full-resolution frames at specific times; the downloaded video stays cached for later calls."""
+    video, _ = get_video(source, is_local, vid, args)
+    out = CACHE_ROOT / vid / "at"
+    out.mkdir(parents=True, exist_ok=True)
+    duration = media_info(video)["duration"]
+    for t in times:
+        if duration and t >= duration:
+            log(f"skip {ts(t)}: past the end ({ts(duration)})")
+            continue
+        dest = out / f"at_{ts(t).replace(':', '-')}_{t:.1f}.jpg"
+        if grab_frame(video, t, dest, AT_FRAME_MAX_EDGE):
+            print(dest)
+        else:
+            log(f"could not grab frame at {ts(t)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("source", help="video URL or local file path")
     ap.add_argument("--probe", action="store_true", help="print metadata only, no download")
+    ap.add_argument("--start", help="only analyze from this time (SS, MM:SS, HH:MM:SS)")
+    ap.add_argument("--end", help="only analyze up to this time")
+    ap.add_argument("--at", help="comma-separated times: save full-res frames there and exit")
     ap.add_argument("--max-frames", type=int, default=100)
     ap.add_argument("--interval", type=float, default=5.0, help="max seconds between frames before capping")
+    ap.add_argument("--no-dedup", action="store_true", help="keep near-identical frames")
     ap.add_argument("--no-frames", action="store_true", help="transcript only")
     ap.add_argument("--force-asr", action="store_true", help="ignore subtitles, transcribe audio locally")
     ap.add_argument("--lang", help="subtitle / ASR language hint, e.g. zh, en, ja")
     ap.add_argument("--cookies-from-browser", help="e.g. chrome, safari (for login-only videos)")
-    ap.add_argument("--keep-video", action="store_true")
+    ap.add_argument("--keep-video", action="store_true", help="keep the downloaded video in the cache")
     ap.add_argument("--refresh", action="store_true", help="ignore cache")
     ap.add_argument("--audio-only", action="store_true", help="just save the audio file (prints its path)")
     ap.add_argument("--audio-format", default="original", choices=["original", "wav", "flac", "mp3", "m4a"],
@@ -424,13 +547,17 @@ def main() -> None:
         if args.audio_format == "original":
             sys.exit("--sample-rate/--mono need a re-encoded --audio-format (wav/flac/mp3/m4a)")
         args.ffmpeg_audio_opts = (["-ar", str(args.sample_rate)] if args.sample_rate else []) + (["-ac", "1"] if args.mono else [])
+    args.start = parse_time(args.start) if args.start else None
+    args.end = parse_time(args.end) if args.end else None
+    if args.start is not None and args.end is not None and args.end <= args.start:
+        sys.exit("--end must be after --start")
 
     for tool in ("ffmpeg", "ffprobe", "uv", YTDLP[0]):
         if not shutil.which(tool):
             sys.exit(f"missing dependency: {tool} (brew install {tool})")
 
     local = Path(args.source).expanduser()
-    is_local = local.exists()
+    is_local = local.is_file()
     info: dict = {}
     if is_local:
         st = local.resolve().stat()
@@ -449,13 +576,19 @@ def main() -> None:
     if args.audio_only:
         extract_audio(args.source, is_local, info, vid, args)
         return
+    if args.at:
+        grab_at(args.source, is_local, vid, [parse_time(t) for t in args.at.split(",") if t.strip()], args)
+        return
 
+    rng = range_tag(args.start, args.end)
     variant = (("noframes" if args.no_frames else f"f{args.max_frames}i{args.interval:g}")
-               + ("-asr" if args.force_asr else "") + (f"-{args.lang}" if args.lang else ""))
+               + ("-nodedup" if args.no_dedup else "") + ("-asr" if args.force_asr else "")
+               + (f"-{args.lang}" if args.lang else "") + rng)
     out = CACHE_ROOT / vid / variant
-    has_video = any(out.glob("video.*"))
-    if (out / "timeline.md").exists() and not args.refresh and (has_video or not args.keep_video or is_local):
+    if (out / "timeline.md").exists() and not args.refresh:
         log("cache hit")
+        if args.keep_video and not is_local:
+            get_video(args.source, is_local, vid, args)  # make sure the video is there to keep
         print(out / "timeline.md")
         return
     if out.exists():
@@ -477,15 +610,21 @@ def main() -> None:
             if segs:
                 meta["transcript_source"] = f"{'YouTube auto-captions' if sub[1] else 'uploaded subtitles'} ({sub[0]})"
 
+    start = args.start or 0.0
+    end = args.end if args.end is not None else (float(info.get("duration") or 0) or float("inf"))
     need_media = not args.no_frames or not segs
-    video = None
+    video, downloaded, mi = None, False, {}
     if need_media:
-        video = local if is_local else download_video(args.source, out, args)
+        video, downloaded = get_video(args.source, is_local, vid, args)
         mi = media_info(video)
+        if mi["duration"]:
+            end = min(end, mi["duration"])
+        if end == float("inf"):
+            sys.exit("cannot tell the video's duration; pass --end")
         meta["duration"] = ts(mi["duration"])
         if not segs:
             if mi["has_audio"]:
-                segs = transcribe_local(video, out, args.lang)
+                segs = transcribe_local(video, out, args.lang, start, end)
                 if segs:
                     meta["transcript_source"] = "local Whisper ASR (mlx-whisper large-v3-turbo; may contain recognition errors)"
                 else:
@@ -494,19 +633,35 @@ def main() -> None:
                 meta["limitations"].append("video has no audio track")
     else:
         meta["duration"] = ts(info.get("duration") or 0)
+    if start >= end:
+        sys.exit(f"--start is past the end of the video ({meta['duration']})")
+    if rng:
+        meta["range"] = f"{ts(start)} - {ts(end) if end != float('inf') else 'end'} (only this part was analyzed)"
+        # Keep cues that overlap the range; a cue lasts until the next one starts when it has no end.
+        nxt = [s["start"] for s in segs[1:]] + [float("inf")]
+        segs = [s for s, n in zip(segs, nxt) if s["start"] < end and s.get("end", n) > start]
 
     frames, sheets = [], []
-    if not args.no_frames and video is not None:
-        mi = media_info(video)
-        if mi["has_video"]:
-            frames = plan_frames(mi["duration"], detect_scenes(video), args.interval, args.max_frames)
-            extract_frames(video, frames, out)
-            sheets = make_sheets(frames, out)
-            if mi["duration"] / max(len(frames), 1) > args.interval * 1.5:
-                meta["limitations"].append(
-                    f"long video: ~1 frame per {mi['duration'] / max(len(frames), 1):.0f}s on average")
+    if not args.no_frames and mi.get("has_video"):
+        frames = plan_frames(start, end, detect_scenes(video, start, end), args.interval,
+                             args.max_frames if args.no_dedup else args.max_frames * 2)
+        extract_frames(video, frames, out)
+        if not args.no_dedup:
+            log(f"removed {drop_near_duplicates(frames, out)} near-duplicate frames")
+            keep = thin(frames, start, end, args.max_frames)
+            keep_ids = {id(f) for f in keep}
+            for f in frames:
+                if id(f) not in keep_ids:
+                    (out / f["file"]).unlink(missing_ok=True)
+            frames = keep
+        finalize_frame_names(frames, out)
+        sheets = make_sheets(frames, out)
+        gap = (end - start) / max(len(frames), 1)
+        if gap > args.interval * 1.5:
+            meta["limitations"].append(f"~1 frame per {gap:.0f}s on average (sparse: long span or static shots)")
 
-    if video is not None and not is_local and not args.keep_video:
+    # Only remove a video this run downloaded; one cached by --at / --keep-video stays.
+    if downloaded and not args.keep_video:
         video.unlink(missing_ok=True)
 
     write_outputs(out, meta, frames, sheets, segs)
